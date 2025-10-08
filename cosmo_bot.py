@@ -1,6 +1,7 @@
 import telebot
 import requests
 import json
+import time
 
 # === НАСТРОЙКИ ===
 TELEGRAM_TOKEN = "7740201104:AAE-DORHQZCRo311ElNhu2ftXx69qUy_SW8"
@@ -44,8 +45,22 @@ SYSTEM_PROMPT = """Ты — Космо, дружелюбный и энтузиа
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-def ask_yandex_gpt(user_message):
-    """Функция для обращения к Yandex GPT"""
+# Хранилище для истории диалогов
+user_sessions = {}
+
+def get_user_session(user_id):
+    """Получаем или создаем сессию пользователя"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = [
+            {
+                "role": "system", 
+                "text": SYSTEM_PROMPT
+            }
+        ]
+    return user_sessions[user_id]
+
+def ask_yandex_gpt(user_message, user_id):
+    """Функция для обращения к Yandex GPT с учетом истории"""
     try:
         url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         
@@ -55,50 +70,100 @@ def ask_yandex_gpt(user_message):
             "x-folder-id": YANDEX_FOLDER_ID
         }
         
+        # Получаем историю диалога пользователя
+        messages = get_user_session(user_id)
+        
+        # Добавляем новое сообщение пользователя
+        messages.append({
+            "role": "user",
+            "text": user_message
+        })
+        
+        # Ограничиваем историю, чтобы не превысить лимит токенов
+        if len(messages) > 10:
+            messages = [messages[0]] + messages[-9:]
+        
         data = {
-            "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+            "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
             "completionOptions": {
                 "stream": False,
                 "temperature": 0.7,
                 "maxTokens": 1000
             },
-            "messages": [
-                {
-                    "role": "system", 
-                    "text": SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "text": user_message
-                }
-            ]
+            "messages": messages
         }
         
-        print(f"[DEBUG] Отправляю запрос к YandexGPT...")
+        print(f"[DEBUG] Отправляю запрос к YandexGPT для пользователя {user_id}...")
         response = requests.post(url, headers=headers, json=data, timeout=30)
         print(f"[DEBUG] Получен ответ. Код статуса: {response.status_code}")
         
-        response.raise_for_status()
+        if response.status_code != 200:
+            print(f"❌ Ошибка API: {response.status_code}")
+            print(f"📄 Ответ: {response.text}")
+            return "⚠️ Произошла ошибка при обращении к нейросети. Попробуйте позже."
         
         result = response.json()
-        return result['result']['alternatives'][0]['message']['text']
+        ai_response = result['result']['alternatives'][0]['message']['text']
         
+        # Добавляем ответ ассистента в историю
+        messages.append({
+            "role": "assistant",
+            "text": ai_response
+        })
+        
+        # Обновляем сессию
+        user_sessions[user_id] = messages
+        
+        return ai_response
+        
+    except requests.exceptions.Timeout:
+        print("❌ Таймаут при запросе к YandexGPT")
+        return "⚠️ Время ожидания ответа истекло. Попробуйте еще раз."
+    except requests.exceptions.ConnectionError:
+        print("❌ Ошибка соединения с YandexGPT")
+        return "⚠️ Ошибка соединения. Проверьте интернет и попробуйте снова."
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
-        if 'response' in locals():
-            print(f"📄 Детали ошибки: {response.text}")
-        return f"⚠️ Ошибка: {str(e)}"
+        print(f"❌ Неизвестная ошибка: {e}")
+        return f"⚠️ Произошла ошибка: {str(e)}"
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    user_id = message.from_user.id
+    # Очищаем историю при старте
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    
     welcome_text = """🚀 Здравствуй, пилот! Я Космо, робот-смотритель Лунной базы "Селен". У нас случилась авария в системе энергоснабжения! Ты мне поможешь всё починить?"""
     bot.reply_to(message, welcome_text)
 
+@bot.message_handler(commands=['reset'])
+def reset_conversation(message):
+    user_id = message.from_user.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    bot.reply_to(message, "🔄 Диалог сброшен! Начнем заново. Используй /start для начала квеста.")
+
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
+    user_id = message.from_user.id
     bot.send_chat_action(message.chat.id, 'typing')
-    ai_response = ask_yandex_gpt(message.text)
+    
+    # Добавляем небольшую задержку для естественности
+    time.sleep(1)
+    
+    ai_response = ask_yandex_gpt(message.text, user_id)
     bot.reply_to(message, ai_response)
 
-print("🟢 Бот запущен! Остановить: Ctrl+C")
-bot.polling()
+# Обработка ошибок бота
+def start_bot():
+    while True:
+        try:
+            print("🟢 Бот запущен! Остановить: Ctrl+C")
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            print(f"❌ Ошибка в работе бота: {e}")
+            print("🔄 Перезапуск через 10 секунд...")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    start_bot()
